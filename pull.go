@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,11 +92,9 @@ func doPull(image string, opts pullOptions) error {
 		return err
 	}
 	client.MaxRetries = opts.retries
-	var logMu sync.Mutex
+	// Until the progress tracker starts, retry notices go to stderr directly.
 	client.OnRetry = func(op string, attempt, max int, delay time.Duration, lastErr error) {
-		logMu.Lock()
-		defer logMu.Unlock()
-		fmt.Fprintf(os.Stderr, "\n[retry %d/%d] %s failed: %v; waiting %s...\n",
+		fmt.Fprintf(os.Stderr, "[retry %d/%d] %s failed: %v; waiting %s...\n",
 			attempt, max, op, lastErr, delay)
 	}
 
@@ -115,22 +112,29 @@ func doPull(image string, opts pullOptions) error {
 		return err
 	}
 
-	var totalBytes int64 = manifest.Config.Size
-	for _, l := range manifest.Layers {
-		totalBytes += l.Size
+	configState := newLayerState(manifest.Config.Digest, manifest.Config.Size)
+	layerStates := make([]*layerState, len(manifest.Layers))
+	for i, l := range manifest.Layers {
+		layerStates[i] = newLayerState(l.Digest, l.Size)
 	}
 
-	var downloaded atomic.Int64
-	progressDone := make(chan struct{})
-	go printProgress(ctx, &downloaded, totalBytes, progressDone)
+	tracker := newProgressTracker(configState, layerStates)
+	go tracker.Run(ctx)
+	// Once the tracker is up, retries go through it so the bar chart stays clean.
+	client.OnRetry = func(op string, attempt, max int, delay time.Duration, lastErr error) {
+		tracker.Message("[retry %d/%d] %s failed: %v; waiting %s...",
+			attempt, max, op, lastErr, delay)
+	}
 
 	configPath := filepath.Join(dir, digestHex(manifest.Config.Digest))
-	if err := client.DownloadBlob(ctx, ref, manifest.Config.Digest, configPath, func(n int64) {
-		downloaded.Add(n)
+	if err := client.DownloadBlob(ctx, ref, manifest.Config.Digest, configPath, func(total int64) {
+		configState.downloaded.Store(total)
 	}); err != nil {
-		close(progressDone)
+		configState.setError(err)
+		tracker.Stop()
 		return fmt.Errorf("download config: %w", err)
 	}
+	configState.setDone()
 
 	layerPaths := make([]string, len(manifest.Layers))
 	sem := make(chan struct{}, opts.concurrency)
@@ -138,23 +142,27 @@ func doPull(image string, opts pullOptions) error {
 	var wg sync.WaitGroup
 	for i, l := range manifest.Layers {
 		i, l := i, l
+		state := layerStates[i]
 		layerPaths[i] = filepath.Join(dir, digestHex(l.Digest))
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			err := client.DownloadBlob(ctx, ref, l.Digest, layerPaths[i], func(n int64) {
-				downloaded.Add(n)
+			err := client.DownloadBlob(ctx, ref, l.Digest, layerPaths[i], func(total int64) {
+				state.downloaded.Store(total)
 			})
 			if err != nil {
+				state.setError(err)
 				errs <- fmt.Errorf("layer %s: %w", l.Digest[:19], err)
+				return
 			}
+			state.setDone()
 		}()
 	}
 	wg.Wait()
 	close(errs)
-	close(progressDone)
+	tracker.Stop()
 
 	var errList []error
 	for e := range errs {
@@ -179,7 +187,7 @@ func doPull(image string, opts pullOptions) error {
 		layerDigests[i] = l.Digest
 	}
 
-	fmt.Fprintf(os.Stderr, "\npacking into %s ...\n", output)
+	fmt.Fprintf(os.Stderr, "packing into %s ...\n", output)
 	if err := tarball.Write(output, repoTag, manifest.Config.Digest, configPath, layerDigests, layerPaths); err != nil {
 		return fmt.Errorf("pack tarball: %w", err)
 	}
@@ -222,35 +230,4 @@ func defaultOutputName(ref registry.Reference) string {
 		suffix = digestHex(ref.Digest)[:12]
 	}
 	return base + "_" + suffix + ".tar"
-}
-
-func printProgress(ctx context.Context, counter *atomic.Int64, total int64, done <-chan struct{}) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	var last int64
-	lastT := time.Now()
-	for {
-		select {
-		case <-done:
-			fmt.Fprintln(os.Stderr)
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			cur := counter.Load()
-			now := time.Now()
-			dt := now.Sub(lastT).Seconds()
-			var rate float64
-			if dt > 0 {
-				rate = float64(cur-last) / dt
-			}
-			last, lastT = cur, now
-			pct := 0.0
-			if total > 0 {
-				pct = float64(cur) / float64(total) * 100
-			}
-			fmt.Fprintf(os.Stderr, "\rdownloading %s / %s (%.1f%%) %s/s  ",
-				humanBytes(cur), humanBytes(total), pct, humanBytes(int64(rate)))
-		}
-	}
 }

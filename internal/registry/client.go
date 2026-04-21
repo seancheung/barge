@@ -183,6 +183,10 @@ func (c *Client) getManifestOnce(ctx context.Context, ref Reference) ([]byte, st
 // DownloadBlob writes a blob to dstPath with resume support and sha256 check.
 // Retries transient failures; the on-disk .part file preserves progress across
 // attempts so we never restart from zero.
+//
+// The progress callback receives the *total* bytes downloaded for this blob so
+// far (an absolute count, monotonically non-decreasing). Callers that want
+// deltas can subtract the previous value themselves.
 func (c *Client) DownloadBlob(ctx context.Context, ref Reference, digest, dstPath string, progress func(int64)) error {
 	return c.retry(ctx, "blob "+shortDigest(digest), func() error {
 		return c.downloadBlobOnce(ctx, ref, digest, dstPath, progress)
@@ -241,10 +245,20 @@ func (c *Client) downloadBlobOnce(ctx context.Context, ref Reference, digest, ds
 	if err != nil {
 		return err
 	}
-	if progress != nil && offset > 0 {
-		progress(offset)
+	current := offset
+	if progress != nil {
+		progress(current)
 	}
-	if _, err := io.Copy(out, &progressReader{r: resp.Body, cb: progress}); err != nil {
+	reader := &progressReader{
+		r: resp.Body,
+		cb: func(n int64) {
+			current += n
+			if progress != nil {
+				progress(current)
+			}
+		},
+	}
+	if _, err := io.Copy(out, reader); err != nil {
 		out.Close()
 		return err
 	}
