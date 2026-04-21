@@ -48,12 +48,14 @@ func (s *layerState) status() string {
 	}
 }
 
-// progressTracker coordinates the progress printer with async events (retries,
-// log messages). The printer goroutine owns all stderr writes.
+// progressTracker owns stderr and redraws the progress frame on a timer.
+// Retries are deliberately silent — if they keep succeeding, the only visible
+// effect is continued progress; if the budget is exhausted, the returned error
+// is surfaced by the caller.
 type progressTracker struct {
 	config  *layerState
 	layers  []*layerState
-	msgs    chan string // out-of-band messages (retry notices, warnings)
+	tty     bool
 	done    chan struct{}
 	stopped chan struct{}
 }
@@ -62,18 +64,9 @@ func newProgressTracker(config *layerState, layers []*layerState) *progressTrack
 	return &progressTracker{
 		config:  config,
 		layers:  layers,
-		msgs:    make(chan string, 16),
+		tty:     isTerminal(os.Stderr),
 		done:    make(chan struct{}),
 		stopped: make(chan struct{}),
-	}
-}
-
-// Message queues a line to be printed above the progress bars on next tick.
-func (p *progressTracker) Message(format string, args ...any) {
-	select {
-	case p.msgs <- fmt.Sprintf(format, args...):
-	default:
-		// channel full — drop silently rather than block downloaders
 	}
 }
 
@@ -94,7 +87,6 @@ type stats struct {
 // Run drives the renderer until Stop is called or ctx is done.
 func (p *progressTracker) Run(ctx context.Context) {
 	defer close(p.stopped)
-	tty := isTerminal(os.Stderr)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -126,15 +118,10 @@ func (p *progressTracker) Run(ctx context.Context) {
 		}
 		return stats{rate: rate, elapsed: now.Sub(start), eta: eta}
 	}
-	clearFrame := func() {
-		if tty && prevLines > 0 {
-			fmt.Fprintf(os.Stderr, "\033[%dA\033[J", prevLines)
-		}
-		prevLines = 0
-	}
+
 	draw := func() {
 		st := computeStats()
-		if tty {
+		if p.tty {
 			if prevLines > 0 {
 				fmt.Fprintf(os.Stderr, "\033[%dA", prevLines)
 			}
@@ -147,27 +134,24 @@ func (p *progressTracker) Run(ctx context.Context) {
 	for {
 		select {
 		case <-p.done:
-			clearFrame()
-			st := computeStats()
-			if tty {
-				prevLines = p.render(os.Stderr, st)
-			} else {
-				p.renderSummary(os.Stderr, st)
-			}
+			draw()
 			return
 		case <-ctx.Done():
 			return
-		case msg := <-p.msgs:
-			clearFrame()
-			fmt.Fprintln(os.Stderr, msg)
-			draw()
 		case <-ticker.C:
 			draw()
 		}
 	}
 }
 
-// render writes the multi-line bar chart (TTY). Returns number of lines written.
+// render writes the multi-line frame (TTY). Returns number of lines written.
+//
+// Layout:
+//   config     [....] bytes pct status
+//   <digest>   [....] bytes pct status
+//   ...
+//   total      [....] bytes pct
+//              <rate>/s  elapsed <t>  ETA <t>
 func (p *progressTracker) render(w io.Writer, st stats) int {
 	lines := 0
 	if p.config != nil {
@@ -179,7 +163,9 @@ func (p *progressTracker) render(w io.Writer, st stats) int {
 		lines++
 	}
 	sumDl, sumSize := p.totals()
-	fmt.Fprintf(w, "%s  %s\033[K\n", padRight("total", 8), totalLine(sumDl, sumSize, st))
+	fmt.Fprintf(w, "%s  %s\033[K\n", padRight("total", 8), totalLine(sumDl, sumSize))
+	lines++
+	fmt.Fprintf(w, "%s  %s\033[K\n", padRight("", 8), statsLine(st))
 	lines++
 	return lines
 }
@@ -191,9 +177,8 @@ func (p *progressTracker) renderSummary(w io.Writer, st stats) {
 	if sumSize > 0 {
 		pct = float64(sumDl) / float64(sumSize) * 100
 	}
-	fmt.Fprintf(w, "downloading %s / %s (%.1f%%)  %s/s  elapsed %s  ETA %s\n",
-		humanBytes(sumDl), humanBytes(sumSize), pct,
-		humanBytes(int64(st.rate)), formatDuration(st.elapsed), formatETA(st.eta))
+	fmt.Fprintf(w, "downloading %s / %s (%.1f%%)  %s\n",
+		humanBytes(sumDl), humanBytes(sumSize), pct, statsLine(st))
 }
 
 func (p *progressTracker) totals() (int64, int64) {
@@ -223,16 +208,17 @@ func lineFor(s *layerState) string {
 		s.status())
 }
 
-func totalLine(dl, total int64, st stats) string {
+func totalLine(dl, total int64) string {
 	pct := 0.0
 	if total > 0 {
 		pct = float64(dl) / float64(total) * 100
 	}
-	return fmt.Sprintf("%s %9s / %-9s %5.1f%%  %8s/s  elapsed %-6s  ETA %s",
-		bar(dl, total, 24),
-		humanBytes(dl),
-		humanBytes(total),
-		pct,
+	return fmt.Sprintf("%s %9s / %-9s %5.1f%%",
+		bar(dl, total, 24), humanBytes(dl), humanBytes(total), pct)
+}
+
+func statsLine(st stats) string {
+	return fmt.Sprintf("%s/s  elapsed %s  ETA %s",
 		humanBytes(int64(st.rate)),
 		formatDuration(st.elapsed),
 		formatETA(st.eta))

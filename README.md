@@ -132,9 +132,11 @@ barge pull nginx:1.25
 
 Transient failures (network errors, HTTP 5xx, unexpected EOF) are retried automatically with exponential backoff (1s → 2s → 4s → …, capped at 30s). The on-disk `.part` file preserves progress, so retries never restart from zero. Non-retryable errors (4xx, sha256 mismatch, context cancellation) fail fast.
 
+`--retries N` caps **consecutive failures without progress**, not total attempts. For blob downloads, the budget resets whenever an attempt grows the `.part` file — a flaky connection that drops every 50MB but keeps advancing will finish, while a fully stalled one gives up after N in a row.
+
 ```bash
-barge pull --retries 5 big-image:tag   # 5 attempts per blob/manifest
-barge pull --retries 0 big-image:tag   # disable retries
+barge pull --retries 5 big-image:tag   # up to 5 consecutive stalled failures
+barge pull --retries 0 big-image:tag   # disable retries entirely
 ```
 
 ### Inspect and clean the cache
@@ -165,7 +167,7 @@ barge clean -a            # same as above
 | `--platform` | `-p` | Target platform `os/arch[/variant]` (defaults to host arch) |
 | `--proxy` | `-x` | HTTP/HTTPS proxy URL (falls back to `HTTPS_PROXY`) |
 | `--concurrency` | `-c` | Number of layers downloaded in parallel (default 3) |
-| `--retries` | `-r` | Max retries per blob/manifest on transient failures (default 3) |
+| `--retries` | `-r` | Max consecutive failures without progress per blob/manifest (default 3) |
 | `--username` | `-u` | Registry username |
 | `--password` |   | Password / token (prefer `--password-stdin`) |
 | `--password-stdin` |   | Read password / token from stdin |

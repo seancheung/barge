@@ -67,12 +67,19 @@ func (c *Client) maxRetries() int {
 	return c.MaxRetries
 }
 
-// retry runs fn up to maxRetries+1 times, with exponential backoff between
-// attempts, bailing out on non-retryable errors or ctx cancellation.
-func (c *Client) retry(ctx context.Context, op string, fn func() error) error {
+// retry runs fn with exponential backoff on retryable errors.
+//
+// The consecutive-failure counter resets to 0 whenever progressing() returns
+// true (i.e. the attempt made forward progress, such as writing new bytes to a
+// .part file). That way --retries N is a cap on *consecutive* failures without
+// progress, not a cap on total attempts over the blob's lifetime. Pass
+// progressing=nil to disable the reset behavior (used for requests where
+// "progress" is meaningless, e.g. manifest fetches).
+func (c *Client) retry(ctx context.Context, op string, progressing func() bool, fn func() error) error {
 	var lastErr error
 	max := c.maxRetries()
-	for attempt := 0; attempt <= max; attempt++ {
+	attempt := 0
+	for {
 		if attempt > 0 {
 			delay := backoff(attempt)
 			if c.OnRetry != nil {
@@ -95,8 +102,14 @@ func (c *Client) retry(ctx context.Context, op string, fn func() error) error {
 			return err
 		}
 		lastErr = err
+		if progressing != nil && progressing() {
+			attempt = 0 // made progress; reset the budget
+		}
+		attempt++
+		if attempt > max {
+			return fmt.Errorf("giving up after %d consecutive failures without progress: %w", max, lastErr)
+		}
 	}
-	return fmt.Errorf("giving up after %d retries: %w", max, lastErr)
 }
 
 func backoff(attempt int) time.Duration {
@@ -145,7 +158,7 @@ func isRetryable(err error) bool {
 
 // GetManifest returns (body, contentType, digest). Retries on transient errors.
 func (c *Client) GetManifest(ctx context.Context, ref Reference) (body []byte, contentType, digest string, err error) {
-	err = c.retry(ctx, "manifest "+ref.Repository, func() error {
+	err = c.retry(ctx, "manifest "+ref.Repository, nil, func() error {
 		var e error
 		body, contentType, digest, e = c.getManifestOnce(ctx, ref)
 		return e
@@ -182,13 +195,31 @@ func (c *Client) getManifestOnce(ctx context.Context, ref Reference) ([]byte, st
 
 // DownloadBlob writes a blob to dstPath with resume support and sha256 check.
 // Retries transient failures; the on-disk .part file preserves progress across
-// attempts so we never restart from zero.
+// attempts so we never restart from zero. The retry budget resets whenever an
+// attempt grows the .part file — i.e. --retries caps *consecutive* stalled
+// failures, not total attempts.
 //
 // The progress callback receives the *total* bytes downloaded for this blob so
 // far (an absolute count, monotonically non-decreasing). Callers that want
 // deltas can subtract the previous value themselves.
 func (c *Client) DownloadBlob(ctx context.Context, ref Reference, digest, dstPath string, progress func(int64)) error {
-	return c.retry(ctx, "blob "+shortDigest(digest), func() error {
+	partPath := dstPath + ".part"
+	var lastSize int64
+	if fi, err := os.Stat(partPath); err == nil {
+		lastSize = fi.Size()
+	}
+	progressing := func() bool {
+		var cur int64
+		if fi, err := os.Stat(partPath); err == nil {
+			cur = fi.Size()
+		}
+		if cur > lastSize {
+			lastSize = cur
+			return true
+		}
+		return false
+	}
+	return c.retry(ctx, "blob "+shortDigest(digest), progressing, func() error {
 		return c.downloadBlobOnce(ctx, ref, digest, dstPath, progress)
 	})
 }

@@ -156,7 +156,7 @@ barge clean -a            # 同上
 | `--platform` | `-p` | 目标平台 `os/arch[/variant]`（默认 `linux/<当前主机架构>`） |
 | `--proxy` | `-x` | HTTP/HTTPS 代理 URL（默认读 `HTTPS_PROXY`） |
 | `--concurrency` | `-c` | 并发下载 layer 数（默认 3） |
-| `--retries` | `-r` | 每个 blob/manifest 的最大重试次数（默认 3，遇网络错误/5xx/EOF 自动重试，指数退避 1s → 2s → 4s…） |
+| `--retries` | `-r` | **连续**无进展的最大失败次数（默认 3）。blob 下载每次有字节写入 `.part` 就重置计数，所以频繁闪断但能推进的网络不会被提前放弃 |
 | `--username` | `-u` | registry 用户名 |
 | `--password` | | 密码/token（不推荐，建议用 `--password-stdin`） |
 | `--password-stdin` | | 从 stdin 读取密码/token |

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/theoxuanx/barge/internal/registry"
 	"github.com/theoxuanx/barge/internal/tarball"
@@ -44,7 +43,7 @@ func runPull(args []string) error {
 	fs.StringVar(&opts.proxyURL, "x", "", "alias of --proxy")
 	fs.IntVar(&opts.concurrency, "concurrency", 3, "number of layers to download in parallel")
 	fs.IntVar(&opts.concurrency, "c", 3, "alias of --concurrency")
-	fs.IntVar(&opts.retries, "retries", 3, "max retries per blob/manifest on transient failures")
+	fs.IntVar(&opts.retries, "retries", 3, "max consecutive failures without progress before giving up")
 	fs.IntVar(&opts.retries, "r", 3, "alias of --retries")
 	fs.StringVar(&opts.username, "username", "", "registry username")
 	fs.StringVar(&opts.username, "u", "", "alias of --username")
@@ -92,11 +91,6 @@ func doPull(image string, opts pullOptions) error {
 		return err
 	}
 	client.MaxRetries = opts.retries
-	// Until the progress tracker starts, retry notices go to stderr directly.
-	client.OnRetry = func(op string, attempt, max int, delay time.Duration, lastErr error) {
-		fmt.Fprintf(os.Stderr, "[retry %d/%d] %s failed: %v; waiting %s...\n",
-			attempt, max, op, lastErr, delay)
-	}
 
 	fmt.Fprintln(os.Stderr, "fetching manifest...")
 	manifest, _, _, err := client.ResolveManifest(ctx, ref, opts.platform)
@@ -120,11 +114,6 @@ func doPull(image string, opts pullOptions) error {
 
 	tracker := newProgressTracker(configState, layerStates)
 	go tracker.Run(ctx)
-	// Once the tracker is up, retries go through it so the bar chart stays clean.
-	client.OnRetry = func(op string, attempt, max int, delay time.Duration, lastErr error) {
-		tracker.Message("[retry %d/%d] %s failed: %v; waiting %s...",
-			attempt, max, op, lastErr, delay)
-	}
 
 	configPath := filepath.Join(dir, digestHex(manifest.Config.Digest))
 	if err := client.DownloadBlob(ctx, ref, manifest.Config.Digest, configPath, func(total int64) {
