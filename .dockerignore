@@ -1,0 +1,7 @@
+.git
+.github
+dist
+build
+*.tar
+*.part
+.DS_Store

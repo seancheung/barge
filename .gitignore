@@ -1,0 +1,7 @@
+/dist/
+/build/
+*.tar
+*.part
+.DS_Store
+/barge
+/barge.exe
