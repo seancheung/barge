@@ -11,16 +11,56 @@ import (
 )
 
 // layerState tracks one blob (config or layer) for display.
+//
+// `downloaded` is the absolute byte count currently on disk for this blob —
+// cache hits and partial resumes are already reflected here at startup. It is
+// what drives the progress bar / percentage.
+//
+// `transferred` counts bytes actually read from the network during this run.
+// The rate calculation is based on `transferred`, not `downloaded`, so that
+// recognizing a multi-GB cached blob does not produce a bogus speed spike.
 type layerState struct {
-	digest     string
-	size       int64
-	downloaded atomic.Int64
-	done       atomic.Bool
-	errMsg     atomic.Pointer[string]
+	digest      string
+	size        int64
+	downloaded  atomic.Int64
+	transferred atomic.Int64
+	done        atomic.Bool
+	errMsg      atomic.Pointer[string]
 }
 
 func newLayerState(digest string, size int64) *layerState {
 	return &layerState{digest: digest, size: size}
+}
+
+// seedFromDisk primes a layerState's downloaded counter from the current
+// on-disk state of dstPath (or its .part sibling). This runs before the
+// tracker starts so the first rendered frame already reflects any cached or
+// resumable bytes, avoiding a 0 → cache-size jump in the rate calculation.
+func seedFromDisk(s *layerState, dstPath string) {
+	if fi, err := os.Stat(dstPath); err == nil {
+		s.downloaded.Store(fi.Size())
+		return
+	}
+	if fi, err := os.Stat(dstPath + ".part"); err == nil {
+		s.downloaded.Store(fi.Size())
+	}
+}
+
+// progressCallback returns a progress callback suited for client.DownloadBlob.
+// Each invocation receives the absolute bytes-on-disk count; the returned
+// closure stores it on `downloaded` for display and adds only forward
+// movement to `transferred` so the rate calculation excludes pre-existing
+// cached bytes. prev is captured per-callback and is safe because
+// DownloadBlob drives a single blob from a single goroutine.
+func progressCallback(s *layerState) func(int64) {
+	prev := s.downloaded.Load()
+	return func(total int64) {
+		if total > prev {
+			s.transferred.Add(total - prev)
+		}
+		prev = total
+		s.downloaded.Store(total)
+	}
 }
 
 func (s *layerState) setDone() { s.done.Store(true) }
@@ -93,7 +133,7 @@ func (p *progressTracker) Run(ctx context.Context) {
 	start := time.Now()
 	var (
 		prevLines int
-		lastDl    int64
+		lastTr    int64
 		lastTick  = start
 		rate      float64
 	)
@@ -101,16 +141,21 @@ func (p *progressTracker) Run(ctx context.Context) {
 	computeStats := func() stats {
 		now := time.Now()
 		curDl, total := p.totals()
+		curTr := p.totalTransferred()
 		dt := now.Sub(lastTick).Seconds()
 		if dt > 0 {
-			instant := float64(curDl-lastDl) / dt
+			delta := curTr - lastTr
+			if delta < 0 {
+				delta = 0
+			}
+			instant := float64(delta) / dt
 			if rate == 0 {
 				rate = instant
 			} else {
 				rate = 0.3*instant + 0.7*rate
 			}
 		}
-		lastDl = curDl
+		lastTr = curTr
 		lastTick = now
 		var eta time.Duration
 		if rate > 0 && curDl < total {
@@ -192,6 +237,20 @@ func (p *progressTracker) totals() (int64, int64) {
 		total += l.size
 	}
 	return dl, total
+}
+
+// totalTransferred returns the sum of bytes actually read from the network so
+// far across all tracked blobs. This excludes bytes that were already on disk
+// from cache hits or prior partial downloads.
+func (p *progressTracker) totalTransferred() int64 {
+	var t int64
+	if p.config != nil {
+		t += p.config.transferred.Load()
+	}
+	for _, l := range p.layers {
+		t += l.transferred.Load()
+	}
+	return t
 }
 
 func lineFor(s *layerState) string {

@@ -81,7 +81,7 @@ func doPull(image string, opts pullOptions) error {
 	}
 	fmt.Fprintf(os.Stderr, "image:    %s\nplatform: %s\n", ref.RefString(), opts.platform)
 
-	auth, err := buildAuth(ref, opts)
+	auth, err := buildAuth(ref, opts.dockerConfig, opts.username, opts.password, opts.passwordStdin)
 	if err != nil {
 		return err
 	}
@@ -107,40 +107,39 @@ func doPull(image string, opts pullOptions) error {
 	}
 
 	configState := newLayerState(manifest.Config.Digest, manifest.Config.Size)
+	configPath := filepath.Join(dir, digestHex(manifest.Config.Digest))
+	seedFromDisk(configState, configPath)
+
 	layerStates := make([]*layerState, len(manifest.Layers))
+	layerPaths := make([]string, len(manifest.Layers))
 	for i, l := range manifest.Layers {
 		layerStates[i] = newLayerState(l.Digest, l.Size)
+		layerPaths[i] = filepath.Join(dir, digestHex(l.Digest))
+		seedFromDisk(layerStates[i], layerPaths[i])
 	}
 
 	tracker := newProgressTracker(configState, layerStates)
 	go tracker.Run(ctx)
 
-	configPath := filepath.Join(dir, digestHex(manifest.Config.Digest))
-	if err := client.DownloadBlob(ctx, ref, manifest.Config.Digest, configPath, func(total int64) {
-		configState.downloaded.Store(total)
-	}); err != nil {
+	if err := client.DownloadBlob(ctx, ref, manifest.Config.Digest, configPath, progressCallback(configState)); err != nil {
 		configState.setError(err)
 		tracker.Stop()
 		return fmt.Errorf("download config: %w", err)
 	}
 	configState.setDone()
 
-	layerPaths := make([]string, len(manifest.Layers))
 	sem := make(chan struct{}, opts.concurrency)
 	errs := make(chan error, len(manifest.Layers))
 	var wg sync.WaitGroup
 	for i, l := range manifest.Layers {
 		i, l := i, l
 		state := layerStates[i]
-		layerPaths[i] = filepath.Join(dir, digestHex(l.Digest))
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			err := client.DownloadBlob(ctx, ref, l.Digest, layerPaths[i], func(total int64) {
-				state.downloaded.Store(total)
-			})
+			err := client.DownloadBlob(ctx, ref, l.Digest, layerPaths[i], progressCallback(state))
 			if err != nil {
 				state.setError(err)
 				errs <- fmt.Errorf("layer %s: %w", l.Digest[:19], err)
@@ -188,15 +187,15 @@ func doPull(image string, opts pullOptions) error {
 	return nil
 }
 
-func buildAuth(ref registry.Reference, opts pullOptions) (*registry.AuthConfig, error) {
-	auth, err := registry.LoadDockerConfig(opts.dockerConfig)
+func buildAuth(ref registry.Reference, dockerConfig, username, password string, passwordStdin bool) (*registry.AuthConfig, error) {
+	auth, err := registry.LoadDockerConfig(dockerConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: load docker config: %v\n", err)
 		auth = registry.NewAuthConfig()
 	}
 
-	pw := opts.password
-	if opts.passwordStdin {
+	pw := password
+	if passwordStdin {
 		if pw != "" {
 			return nil, fmt.Errorf("--password and --password-stdin are mutually exclusive")
 		}
@@ -206,8 +205,8 @@ func buildAuth(ref registry.Reference, opts pullOptions) (*registry.AuthConfig, 
 		}
 		pw = strings.TrimRight(string(b), "\r\n")
 	}
-	if opts.username != "" || pw != "" {
-		auth.Set(ref.Registry, registry.Credentials{Username: opts.username, Password: pw})
+	if username != "" || pw != "" {
+		auth.Set(ref.Registry, registry.Credentials{Username: username, Password: pw})
 	}
 	return auth, nil
 }

@@ -19,6 +19,10 @@ func main() {
 		if err := runPull(os.Args[2:]); err != nil {
 			fatal(err)
 		}
+	case "urls":
+		if err := runURLs(os.Args[2:]); err != nil {
+			fatal(err)
+		}
 	case "clean":
 		if err := runClean(os.Args[2:]); err != nil {
 			fatal(err)
@@ -48,10 +52,11 @@ func printTopUsage() {
 	fmt.Fprintf(os.Stderr, "barge %s — pull container images from any registry into a docker-load compatible tar\n\n", version)
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintf(os.Stderr, "  %s pull <image> [flags]   pull an image and pack it into a tar\n", name)
+	fmt.Fprintf(os.Stderr, "  %s urls <image> [flags]   list blob URLs + cache paths for external downloaders\n", name)
 	fmt.Fprintf(os.Stderr, "  %s clean [--all]          remove .part files (--all also clears blob cache)\n", name)
 	fmt.Fprintf(os.Stderr, "  %s status                 show cache status\n", name)
 	fmt.Fprintf(os.Stderr, "  %s --version              print version\n\n", name)
-	fmt.Fprintf(os.Stderr, "Run '%s pull --help' for pull flags.\n", name)
+	fmt.Fprintf(os.Stderr, "Run '%s <command> --help' for per-command flags.\n", name)
 }
 
 // bargeHome returns the data root for barge. Defaults to ~/.barge, overridable

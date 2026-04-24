@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -147,6 +148,9 @@ func isRetryable(err error) bool {
 	}
 	for _, k := range []string{
 		"EOF", "reset", "timeout", "refused", "broken pipe",
+		"stream error", "PROTOCOL_ERROR", "INTERNAL_ERROR",
+		"ENHANCE_YOUR_CALM", "GOAWAY", "http2: ",
+		"connection closed", "unexpected EOF",
 		" 500 ", " 502 ", " 503 ", " 504 ", " 429 ",
 	} {
 		if strings.Contains(s, k) {
@@ -380,6 +384,23 @@ func (c *Client) credsFor(registry string) (Credentials, bool) {
 		return Credentials{}, false
 	}
 	return c.Auth.For(registry)
+}
+
+// AuthHeaderFor returns the HTTP Authorization header value that subsequent
+// requests for this registry+repo would send. It returns the Bearer token
+// cached by a prior auth challenge (typically set during ResolveManifest), or
+// a Basic header derived from configured credentials. Returns "" when no auth
+// is needed. The Bearer token is short-lived (minutes), so callers should
+// regenerate the header if external downloads run long.
+func (c *Client) AuthHeaderFor(registry, repo string) string {
+	if v, ok := c.tokens.Load(registry + "|" + repo); ok {
+		return "Bearer " + v.(string)
+	}
+	if creds, ok := c.credsFor(registry); ok && (creds.Username != "" || creds.Password != "") {
+		raw := creds.Username + ":" + creds.Password
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))
+	}
+	return ""
 }
 
 var challengeRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
